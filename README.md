@@ -21,6 +21,52 @@ The entire server lives in a single file (`index.ts`): tool definitions, the Air
 1. **Node.js** 18.0.0 or higher.
 2. **AirLabs API key** — get a free key at <https://airlabs.co/signup>.
 
+## Remote MCP deployment (Docker Compose)
+
+The HTTP transport is intended to run behind an HTTPS reverse proxy. It keeps the
+stdio transport as the default for local MCP clients. Docker Compose binds the
+server to `127.0.0.1:8003`; the existing Nginx instance provides HTTPS and routes
+`/airlabs/mcp` to the container's `/mcp` endpoint. The endpoint requires
+`MCP_BEARER_TOKEN` in `Authorization: Bearer …`.
+
+1. Point the domain's DNS A record to the VPS and allow inbound TCP ports 80 and 443.
+2. Install Docker Engine and the Docker Compose plugin on Ubuntu, then clone this repository.
+3. Create `.env` from `.env.example`; set `AIRLABS_API_KEY` and a unique
+   `MCP_BEARER_TOKEN` of at least 32 characters. Keep `.env` private and out of Git.
+4. Add this location to the existing TLS server block in Nginx:
+
+   ```nginx
+   location = /airlabs/mcp {
+       proxy_pass http://127.0.0.1:8003/mcp;
+       proxy_http_version 1.1;
+       proxy_set_header Host $host;
+       proxy_set_header X-Real-IP $remote_addr;
+       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+       proxy_set_header X-Forwarded-Proto https;
+       proxy_set_header Authorization $http_authorization;
+       proxy_set_header Connection "";
+       proxy_buffering off;
+       proxy_cache off;
+       proxy_read_timeout 3600s;
+   }
+
+   location = /airlabs/health {
+       proxy_pass http://127.0.0.1:8003/health;
+   }
+   ```
+
+5. Start the service:
+
+   ```bash
+   docker compose up -d --build
+   docker compose logs -f
+   ```
+
+6. Configure Sandra with `https://YOUR_DOMAIN/airlabs/mcp` and the matching Bearer token.
+   `https://YOUR_DOMAIN/airlabs/health` provides a basic liveness check.
+
+To update later, run `git pull` followed by `docker compose up -d --build`.
+
 ## Installation
 
 ### Via npm

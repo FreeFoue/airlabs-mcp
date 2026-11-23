@@ -1,0 +1,11 @@
+services:
+  airlabs-mcp:
+    build: .
+    restart: unless-stopped
+    environment:
+      MCP_TRANSPORT: http
+      PORT: 3000
+      AIRLABS_API_KEY: ${AIRLABS_API_KEY:?Set AIRLABS_API_KEY in .env}
+      MCP_BEARER_TOKEN: ${MCP_BEARER_TOKEN:?Set MCP_BEARER_TOKEN in .env}
+    ports:
+      - "127.0.0.1:8003:3000"
