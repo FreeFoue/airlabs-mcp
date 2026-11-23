@@ -12,6 +12,7 @@
   "scripts": {
     "build": "tsc && chmod +x build/index.js",
     "start": "node build/index.js",
+    "start:http": "MCP_TRANSPORT=http node build/index.js",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

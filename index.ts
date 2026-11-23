@@ -25,6 +25,9 @@
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -53,7 +56,8 @@ if (!API_KEY) {
 
 async function airlabsRequest(
   endpoint: string,
-  params: Record<string, string | number | undefined | null>
+  params: Record<string, string | number | undefined | null>,
+  includeEnvelope = false
 ): Promise<unknown> {
   const url = new URL(`${API_BASE}/${endpoint}`);
   for (const [key, value] of Object.entries(params)) {
@@ -91,6 +95,7 @@ async function airlabsRequest(
     );
   }
 
+  if (includeEnvelope) return body;
   return body && "response" in body ? body.response : body;
 }
 
@@ -104,6 +109,91 @@ function toToolError(message: string) {
   return {
     isError: true,
     content: [{ type: "text" as const, text: message }],
+  };
+}
+
+type AirportScheduleTimeFilter = "upcoming_departures" | "upcoming_arrivals";
+const AIRPORT_SCHEDULE_PAGE_SIZE = 100;
+const AIRPORT_SCHEDULE_MAX_PAGES = 10;
+
+function unixTimestamp(record: Record<string, unknown>, field: string): number | undefined {
+  const raw = record[`${field}_ts`];
+  const value = typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw) : NaN;
+  if (!Number.isFinite(value) || value <= 0) return undefined;
+  // AirLabs documents epoch seconds; accept milliseconds defensively as well.
+  return value > 10_000_000_000 ? value / 1000 : value;
+}
+
+function utcTimeToEpoch(raw: unknown): number | undefined {
+  if (typeof raw !== "string" || !raw.trim()) return undefined;
+  const normalized = raw.trim().replace(" ", "T");
+  const parsed = Date.parse(/[zZ]|[+-]\d{2}:?\d{2}$/.test(normalized) ? normalized : `${normalized}Z`);
+  return Number.isFinite(parsed) ? parsed / 1000 : undefined;
+}
+
+function scheduleTime(record: Record<string, unknown>, field: string): number | undefined {
+  return unixTimestamp(record, field) ?? utcTimeToEpoch(record[`${field}_utc`]);
+}
+
+function filterAirportSchedule(
+  data: unknown,
+  filter: AirportScheduleTimeFilter,
+  nowSeconds: number,
+  requestedLimit?: number,
+  pagesRead = 1,
+  hasMore = false,
+  includeActiveArrivals = false
+): {
+  filter_applied: AirportScheduleTimeFilter;
+  as_of_utc: string;
+  upstream_page_size: number;
+  upstream_pages_read: number;
+  upstream_has_more: boolean;
+  rows_received: number;
+  rows_without_usable_utc_time: number;
+  flights: unknown[];
+} {
+  const rows = Array.isArray(data) ? data : [];
+  let rowsWithoutUsableTime = 0;
+  const flights = rows.filter((item) => {
+    if (!item || typeof item !== "object") return false;
+    const row = item as Record<string, unknown>;
+    const status = String(row.status || "").toLowerCase();
+
+    const eventTime = filter === "upcoming_arrivals"
+      ? status === "landed"
+        ? scheduleTime(row, "arr_actual") ?? scheduleTime(row, "arr_estimated") ?? scheduleTime(row, "arr_time")
+        : scheduleTime(row, "arr_estimated") ?? scheduleTime(row, "arr_time")
+      : status === "active" || status === "landed"
+        ? scheduleTime(row, "dep_actual") ?? scheduleTime(row, "dep_estimated") ?? scheduleTime(row, "dep_time")
+        : scheduleTime(row, "dep_estimated") ?? scheduleTime(row, "dep_time");
+    if (eventTime === undefined) rowsWithoutUsableTime += 1;
+    return (filter === "upcoming_arrivals" && status === "active" && includeActiveArrivals) ||
+      (eventTime !== undefined && eventTime > nowSeconds);
+  });
+
+  flights.sort((left, right) => {
+    const leftRow = left as Record<string, unknown>;
+    const rightRow = right as Record<string, unknown>;
+    const eventTime = (row: Record<string, unknown>) => filter === "upcoming_arrivals"
+      ? String(row.status || "").toLowerCase() === "landed"
+        ? scheduleTime(row, "arr_actual") ?? scheduleTime(row, "arr_estimated") ?? scheduleTime(row, "arr_time")
+        : scheduleTime(row, "arr_estimated") ?? scheduleTime(row, "arr_time")
+      : ["active", "landed"].includes(String(row.status || "").toLowerCase())
+        ? scheduleTime(row, "dep_actual") ?? scheduleTime(row, "dep_estimated") ?? scheduleTime(row, "dep_time")
+        : scheduleTime(row, "dep_estimated") ?? scheduleTime(row, "dep_time");
+    return (eventTime(leftRow) ?? 0) - (eventTime(rightRow) ?? 0);
+  });
+
+  return {
+    filter_applied: filter,
+    as_of_utc: new Date(nowSeconds * 1000).toISOString(),
+    upstream_page_size: AIRPORT_SCHEDULE_PAGE_SIZE,
+    upstream_pages_read: pagesRead,
+    upstream_has_more: hasMore,
+    rows_received: rows.length,
+    rows_without_usable_utc_time: rowsWithoutUsableTime,
+    flights: requestedLimit ? flights.slice(0, requestedLimit) : flights,
   };
 }
 
@@ -177,15 +267,16 @@ const TOOLS: Tool[] = [
       "  4) (optional) get_airport_info(iata_code=<each arr_iata>) -> full destination names\n" +
       "Do NOT use find_routes for 'soon/today' — that returns a weekly timetable without live " +
       "times. Use this tool when the user cares about actual times.\n" +
-      "TIME WINDOW & STATUS: the board covers a window from the recent past to several hours " +
-      "ahead, so it mixes flights that have not left yet, are airborne, and have already " +
-      "departed/landed. Each row's 'status' tells which: scheduled = not departed yet, " +
-      "active = airborne, landed = arrived (and 'cancelled'). Interpret the user's intent and " +
-      "filter the rows accordingly when their wording is specific: for 'upcoming / still to " +
-      "depart / next few hours' keep status=scheduled with a future dep_estimated/dep_time; for " +
-      "'already left / departed' keep active/landed. If the user is NOT specific, do NOT drop " +
-      "rows — show them and label each with its status and time. Never silently hide matching " +
-      "flights; if filtering leaves nothing, say so and report what the board does contain.",
+      "TIME WINDOW & STATUS: for requests for future departures or arrivals, set time_filter " +
+      "to upcoming_departures or upcoming_arrivals. The MCP compares each event's estimated " +
+      "time (then scheduled time) to now, or to reference_time if supplied. For landed arrivals, " +
+      "it compares actual arrival time (then estimated/scheduled fallback). Status is shown " +
+      "separately; currently active arrivals remain visible even if their ETA has passed. " +
+      "Cancelled flights are shown if their event time passes the cutoff. Filtering " +
+      "uses AirLabs UTC timestamp fields. reference_time must be ISO-8601 with Z or an explicit " +
+      "UTC offset. " +
+      "The MCP fetches pages of up to 100 rows (up to 10 pages), filters, sorts and then applies limit. Never claim an " +
+      "empty result proves there are no flights beyond the live board's coverage.",
     inputSchema: {
       type: "object",
       properties: {
@@ -198,11 +289,27 @@ const TOOLS: Tool[] = [
         flight_iata: { type: "string", description: "List every instance of this flight IATA number." },
         flight_icao: { type: "string", description: "List every instance of this flight ICAO number." },
         limit: { type: "number", description: "Max rows (airport: up to 1000; airline: 200; free keys: 50)." },
+        offset: {
+          type: "number",
+          description: "Zero-based pagination offset for the AirLabs schedule result list, e.g. 0, 50, 100.",
+        },
+        time_filter: {
+          type: "string",
+          enum: ["all", "upcoming_departures", "upcoming_arrivals"],
+          description:
+            "MCP-side filter by event time after now or reference_time; omit or use 'all' for an unfiltered board.",
+        },
+        reference_time: {
+          type: "string",
+          description:
+            "Optional cutoff as ISO-8601 with Z or explicit UTC offset, e.g. 2026-10-30T08:00:00+01:00.",
+        },
         _fields: {
           type: "string",
           description:
             "Comma-separated fields to keep responses small, e.g. " +
-            "'flight_iata,arr_iata,dep_time,dep_estimated,status'.",
+            "'flight_iata,arr_iata,dep_time,dep_estimated,status'. For time-filtered calls, " +
+            "the MCP adds required Unix timestamp fields internally and hides them unless requested.",
         },
       },
     },
@@ -541,39 +648,211 @@ const server = new Server(
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+const serverCallToolHandler = async (request: { params: { name: string; arguments?: Record<string, unknown> } }) => {
   const { name, arguments: args = {} } = request.params;
   const endpoint = ENDPOINTS[name];
-
-  if (!endpoint) {
-    return toToolError(`Unknown tool: ${name}`);
-  }
-
+  if (!endpoint) return toToolError(`Unknown tool: ${name}`);
   try {
-    const params = { ...(args as Record<string, string | number | undefined | null>) };
-
-    // AirLabs /nearby requires a distance; default to 50 km if the model omits it.
+    const { time_filter, reference_time, ...apiArgs } = args;
+    const params = { ...(apiArgs as Record<string, string | number | undefined | null>) };
+    const timeFilter = name === "get_airport_schedule" &&
+      (time_filter === "upcoming_departures" || time_filter === "upcoming_arrivals")
+      ? time_filter
+      : undefined;
+    let cutoffSeconds = Date.now() / 1000;
+    const hasExplicitReference = typeof reference_time === "string" && Boolean(reference_time.trim());
+    if (hasExplicitReference && typeof reference_time === "string") {
+      const explicit = Date.parse(reference_time);
+      const hasOffset = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(reference_time.trim());
+      if (!hasOffset || !Number.isFinite(explicit)) {
+        throw new Error("reference_time must be ISO-8601 with Z or an explicit UTC offset.");
+      }
+      cutoffSeconds = explicit / 1000;
+    }
+    const originallyRequestedFields = typeof params._fields === "string"
+      ? params._fields.split(",").map((field) => field.trim()).filter(Boolean)
+      : undefined;
+    const timestampFields = timeFilter === "upcoming_arrivals"
+      ? ["arr_actual_ts", "arr_estimated_ts", "arr_time_ts", "arr_actual_utc", "arr_estimated_utc", "arr_time_utc"]
+      : timeFilter === "upcoming_departures"
+        ? ["dep_actual_ts", "dep_estimated_ts", "dep_time_ts", "dep_actual_utc", "dep_estimated_utc", "dep_time_utc"]
+        : [];
+    const parsedLimit = Number(params.limit);
+    const requestedLimit = Number.isInteger(parsedLimit) && parsedLimit > 0 ? parsedLimit : undefined;
+    const startingOffset = Number(params.offset) >= 0 ? Number(params.offset) : 0;
+    if (timeFilter) params.limit = AIRPORT_SCHEDULE_PAGE_SIZE;
+    if (timeFilter && originallyRequestedFields) {
+      params._fields = [...new Set([...originallyRequestedFields, ...timestampFields])].join(",");
+    }
     if (name === "find_nearest_airport" && (params.distance === undefined || params.distance === null)) {
       params.distance = 50;
     }
-
-    const data = await airlabsRequest(endpoint, params);
+    let data: unknown;
+    let pagesRead = 1;
+    let upstreamHasMore = false;
+    if (timeFilter) {
+      const allRows: unknown[] = [];
+      let offset = startingOffset;
+      const maxPages = AIRPORT_SCHEDULE_MAX_PAGES;
+      for (pagesRead = 1; pagesRead <= maxPages; pagesRead += 1) {
+        params.offset = offset;
+        const envelope = await airlabsRequest(endpoint, params, true);
+        const envelopeRecord = envelope && typeof envelope === "object"
+          ? envelope as Record<string, unknown>
+          : undefined;
+        const page = envelopeRecord && "response" in envelopeRecord
+          ? envelopeRecord.response
+          : envelope;
+        const pageRows = Array.isArray(page) ? page : [];
+        allRows.push(...pageRows);
+        const requestMeta = envelopeRecord?.request && typeof envelopeRecord.request === "object"
+          ? envelopeRecord.request as Record<string, unknown>
+          : undefined;
+        const rawHasMore = requestMeta?.has_more;
+        const knownHasMore = typeof rawHasMore === "boolean"
+          ? rawHasMore
+          : typeof rawHasMore === "string"
+            ? ["true", "1", "yes"].includes(rawHasMore.toLowerCase())
+            : undefined;
+        upstreamHasMore = knownHasMore ?? pageRows.length === AIRPORT_SCHEDULE_PAGE_SIZE;
+        const currentMatches = filterAirportSchedule(
+          allRows, timeFilter, cutoffSeconds, undefined, 1, false, !hasExplicitReference
+        ).flights;
+        if (requestedLimit && currentMatches.length >= requestedLimit) break;
+        if (!upstreamHasMore || pageRows.length === 0 || pagesRead === maxPages) break;
+        offset += pageRows.length;
+      }
+      pagesRead = Math.min(pagesRead, maxPages);
+      data = allRows;
+    } else {
+      data = await airlabsRequest(endpoint, params);
+    }
+    if (timeFilter) {
+      const filtered = filterAirportSchedule(
+        data, timeFilter, cutoffSeconds, requestedLimit, pagesRead, upstreamHasMore, !hasExplicitReference
+      );
+      if (originallyRequestedFields) {
+        const requested = new Set(originallyRequestedFields);
+        filtered.flights = filtered.flights.map((flight) => {
+          const row = { ...(flight as Record<string, unknown>) };
+          for (const field of timestampFields) {
+            if (!requested.has(field)) delete row[field];
+          }
+          return row;
+        });
+      }
+      return toToolResult(filtered);
+    }
     return toToolResult(data);
   } catch (err) {
     return toToolError((err as Error).message);
   }
-});
+};
+
+server.setRequestHandler(CallToolRequestSchema, serverCallToolHandler);
 
 // ---------------------------------------------------------------------------
 // Start (stdio transport — used by Claude Desktop, Cursor, etc.)
 // ---------------------------------------------------------------------------
 
-async function main() {
+async function runStdio() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("[airlabs-mcp] AirLabs MCP server running on stdio.");
 }
 
+async function runHttp() {
+  const token = process.env.MCP_BEARER_TOKEN;
+  if (!token || token.length < 32) {
+    throw new Error("MCP_BEARER_TOKEN must contain at least 32 characters in HTTP mode.");
+  }
+  const port = Number(process.env.PORT || "3000");
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("PORT must be a valid TCP port.");
+  }
+
+  const sessions = new Map<string, { server: Server; transport: StreamableHTTPServerTransport }>();
+  const authorized = (req: IncomingMessage) => {
+    const header = req.headers.authorization || "";
+    const expected = Buffer.from(`Bearer ${token}`);
+    const actual = Buffer.from(header);
+    return actual.length === expected.length && timingSafeEqual(actual, expected);
+  };
+
+  const httpServer = createServer(async (req, res) => {
+    if (req.url === "/health") {
+      res.writeHead(200, { "content-type": "application/json" }).end('{"status":"ok"}');
+      return;
+    }
+    if (req.url !== "/mcp") {
+      res.writeHead(404).end("Not found");
+      return;
+    }
+    const origin = req.headers.origin;
+    if (origin) {
+      let originHost: string;
+      try {
+        originHost = new URL(origin).host;
+      } catch {
+        res.writeHead(403).end("Forbidden");
+        return;
+      }
+      if (originHost !== req.headers.host) {
+        res.writeHead(403).end("Forbidden");
+        return;
+      }
+    }
+    if (!authorized(req)) {
+      res.writeHead(401, { "www-authenticate": "Bearer" }).end("Unauthorized");
+      return;
+    }
+
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    let session = sessionId ? sessions.get(sessionId) : undefined;
+    if (sessionId && !session) {
+      res.writeHead(404).end("MCP session not found");
+      return;
+    }
+    if (!session && !sessionId && req.method === "POST") {
+      let sessionServer: Server;
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (id) => {
+          const found = sessions.get(id);
+          if (found) return;
+          sessions.set(id, { server: sessionServer, transport });
+        },
+      });
+      transport.onclose = () => {
+        if (transport.sessionId) sessions.delete(transport.sessionId);
+      };
+      sessionServer = new Server(
+        { name: "airlabs-mcp", version: "1.3.0" },
+        { capabilities: { tools: {} } }
+      );
+      sessionServer.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+      sessionServer.setRequestHandler(CallToolRequestSchema, serverCallToolHandler);
+      await sessionServer.connect(transport);
+      session = { server: sessionServer, transport };
+    }
+    if (!session) {
+      res.writeHead(400).end("Bad Request: missing or invalid MCP session");
+      return;
+    }
+    try {
+      await session.transport.handleRequest(req, res);
+    } catch (err) {
+      console.error("[airlabs-mcp] HTTP request failed:", err);
+      if (!res.headersSent) res.writeHead(500).end("Internal server error");
+      else res.destroy();
+    }
+  });
+  httpServer.listen(port, "0.0.0.0", () => {
+    console.error(`[airlabs-mcp] Streamable HTTP server listening on port ${port}.`);
+  });
+}
+
+const main = process.env.MCP_TRANSPORT === "http" ? runHttp : runStdio;
 main().catch((err) => {
   console.error("[airlabs-mcp] Fatal error:", err);
   process.exit(1);
